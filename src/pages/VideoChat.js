@@ -87,7 +87,15 @@ export default function VideoChat() {
 
       const createPeerConnection = (userId, socket) => {
         const pc = new RTCPeerConnection({
-          iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+          iceServers: [
+            {
+                urls: 'stun:stun.l.google.com:19302' // STUN Google (phụ trợ)
+                },
+                {
+                urls: 'turn:relay1.expressturn.com:3480',
+                username: '174728286587966325',
+                credential: 'gcQpxGMmZ/HwbtAVAw1JbDV+6CU='
+            }]
         });
         peerConnections.current[userId] = pc;
 
