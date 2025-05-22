@@ -20,7 +20,9 @@ export default function VideoChat() {
           return;
         }
 
-        const newSocket = io('https://3.106.188.116.nip.io');
+        const newSocket = io("https://3.106.188.116.nip.io", {
+          transports: ["websocket", "polling"]
+        });
         setSocket(newSocket);
 
         // Initialize local video
