@@ -11,7 +11,9 @@ export default function VideoChat() {
   const [socket, setSocket] = useState(null);
   const peerConnections = useRef({});
   const pendingCandidates = useRef({});
-
+  const isPolite = useRef({});
+  const makingOffer = useRef({});
+  const ignoreOffer = useRef({});
   const searchParams = new URLSearchParams(window.location.search);
   const roomId = searchParams.get('roomId');
   const username = searchParams.get('username');
@@ -41,12 +43,14 @@ export default function VideoChat() {
     newSocket.on('all-users', (otherUsers) => {
       setUsers(otherUsers);
       otherUsers.forEach(user => {
+        isPolite.current[user.id] = false; // người vào trước là impolite
         createPeerConnection(user.id, newSocket);
       });
     });
 
     newSocket.on('user-joined', ({ id, username }) => {
       setUsers(prev => [...prev, { id, username }]);
+      isPolite.current[id] = true; // người vào sau là polite
       createPeerConnection(id, newSocket);
     });
 
@@ -61,7 +65,6 @@ export default function VideoChat() {
         peerConnections.current[id].close();
         delete peerConnections.current[id];
       }
-      delete pendingCandidates.current[id];
     });
 
     newSocket.on('offer', async ({ offer, from }) => {
@@ -71,15 +74,18 @@ export default function VideoChat() {
         pc = peerConnections.current[from];
       }
 
-      try {
-        if (pc.signalingState === 'have-local-offer') {
-          console.warn(`Skipping offer: signalingState = ${pc.signalingState}`);
-          return;
-        }
+      const offerCollision = makingOffer.current[from] || pc.signalingState !== 'stable';
 
+      ignoreOffer.current[from] = !isPolite.current[from] && offerCollision;
+      if (ignoreOffer.current[from]) {
+        console.warn("Skipping offer due to collision (impolite)");
+        return;
+      }
+
+      try {
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
 
-        // Xử lý các ICE candidate bị nhận sớm
+        // Apply pending ICE candidates
         if (pendingCandidates.current[from]) {
           for (const candidate of pendingCandidates.current[from]) {
             await pc.addIceCandidate(new RTCIceCandidate(candidate));
@@ -91,41 +97,35 @@ export default function VideoChat() {
         await pc.setLocalDescription(answer);
         newSocket.emit('answer', { answer, to: from });
       } catch (err) {
-        console.error('Failed to handle offer:', err);
+        console.error('Error handling offer:', err);
       }
     });
 
     newSocket.on('answer', async ({ answer, from }) => {
       const pc = peerConnections.current[from];
       if (!pc) return;
-
       try {
-        if (!pc.currentRemoteDescription) {
-          await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        } else {
-          console.warn(`Skipping answer: unexpected signalingState = ${pc.signalingState}`);
-        }
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
       } catch (err) {
-        console.error('Failed to set remote description (answer):', err);
+        console.error("Error setting remote description for answer:", err);
       }
     });
 
     newSocket.on('ice-candidate', async ({ candidate, from }) => {
       const pc = peerConnections.current[from];
-
-      if (!pc || !pc.remoteDescription) {
-        // Nếu chưa có peer hoặc chưa set remoteDescription, lưu vào buffer
-        if (!pendingCandidates.current[from]) {
-          pendingCandidates.current[from] = [];
+      if (pc) {
+        try {
+          if (pc.remoteDescription) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          } else {
+            if (!pendingCandidates.current[from]) {
+              pendingCandidates.current[from] = [];
+            }
+            pendingCandidates.current[from].push(candidate);
+          }
+        } catch (err) {
+          console.error("Error adding ICE candidate:", err);
         }
-        pendingCandidates.current[from].push(candidate);
-        return;
-      }
-
-      try {
-        await pc.addIceCandidate(new RTCIceCandidate(candidate));
-      } catch (err) {
-        console.error('Error adding ICE candidate:', err);
       }
     });
 
@@ -140,7 +140,7 @@ export default function VideoChat() {
       iceServers: [
         { urls: 'stun:stun.l.google.com:19302' },
         {
-          urls: 'turn:relay1.expressturn.com:3480',
+          urls: 'turn:relay1.expressturn.com:3478',
           username: '174728286587966325',
           credential: 'gcQpxGMmZ/HwbtAVAw1JbDV+6CU='
         }
@@ -149,10 +149,11 @@ export default function VideoChat() {
 
     peerConnections.current[userId] = pc;
 
+    // Add local media tracks
     if (localStreamRef.current) {
-      localStreamRef.current.getTracks().forEach(track =>
-        pc.addTrack(track, localStreamRef.current)
-      );
+      localStreamRef.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStreamRef.current);
+      });
     }
 
     pc.ontrack = (event) => {
@@ -170,11 +171,14 @@ export default function VideoChat() {
 
     pc.onnegotiationneeded = async () => {
       try {
+        makingOffer.current[userId] = true;
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit('offer', { offer, to: userId });
       } catch (err) {
-        console.error('Negotiation error:', err);
+        console.error("Negotiation error:", err);
+      } finally {
+        makingOffer.current[userId] = false;
       }
     };
   };
