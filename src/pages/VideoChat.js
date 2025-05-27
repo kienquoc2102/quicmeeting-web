@@ -10,8 +10,6 @@ export default function VideoChat() {
   const [users, setUsers] = useState([]);
   const [socket, setSocket] = useState(null);
   const peerConnections = useRef({});
-  const makingOffer = useRef({}); // flag per peer
-
   const searchParams = new URLSearchParams(window.location.search);
   const roomId = searchParams.get('roomId');
   const username = searchParams.get('username');
@@ -41,17 +39,13 @@ export default function VideoChat() {
     newSocket.on('all-users', (otherUsers) => {
       setUsers(otherUsers);
       otherUsers.forEach(user => {
-        if (!peerConnections.current[user.id]) {
-          createPeerConnection(user.id, newSocket);
-        }
+        createPeerConnection(user.id, newSocket);
       });
     });
 
     newSocket.on('user-joined', ({ id, username }) => {
       setUsers(prev => [...prev, { id, username }]);
-      if (!peerConnections.current[id]) {
-        createPeerConnection(id, newSocket);
-      }
+      createPeerConnection(id, newSocket);
     });
 
     newSocket.on('user-left', ({ id }) => {
@@ -65,7 +59,6 @@ export default function VideoChat() {
         peerConnections.current[id].close();
         delete peerConnections.current[id];
       }
-      delete makingOffer.current[id];
     });
 
     newSocket.on('offer', async ({ offer, from }) => {
@@ -75,37 +68,43 @@ export default function VideoChat() {
 
       const pc = peerConnections.current[from];
       try {
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        newSocket.emit('answer', { answer, to: from });
+        if (pc.signalingState === 'stable') {
+          await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          newSocket.emit('answer', { answer, to: from });
+        } else {
+          console.warn(`Skipping offer: signalingState = ${pc.signalingState}`);
+        }
       } catch (err) {
-        console.error('Error handling offer:', err);
+        console.error('Failed to set remote description (offer):', err);
       }
     });
 
     newSocket.on('answer', async ({ answer, from }) => {
       const pc = peerConnections.current[from];
       if (!pc) return;
-      if (pc.signalingState !== 'have-local-offer') {
-        console.warn('Skipping answer: wrong signalingState =', pc.signalingState);
-        return;
-      }
 
       try {
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        if (pc.signalingState === 'have-local-offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        } else if (!pc.currentRemoteDescription && pc.signalingState === 'stable') {
+          console.warn('Receiving answer in stable state — accepting anyway');
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        } else {
+          console.warn(`Skipping answer: unexpected signalingState = ${pc.signalingState}`);
+        }
       } catch (err) {
         console.error('Failed to set remote description (answer):', err);
       }
     });
 
     newSocket.on('ice-candidate', async ({ candidate, from }) => {
-      const pc = peerConnections.current[from];
-      if (pc) {
+      if (peerConnections.current[from]) {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          await peerConnections.current[from].addIceCandidate(new RTCIceCandidate(candidate));
         } catch (err) {
-          console.error('Error adding received ICE candidate', err);
+          console.error('Error adding ICE candidate:', err);
         }
       }
     });
@@ -129,7 +128,6 @@ export default function VideoChat() {
     });
 
     peerConnections.current[userId] = pc;
-    makingOffer.current[userId] = false;
 
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track =>
@@ -152,15 +150,11 @@ export default function VideoChat() {
 
     pc.onnegotiationneeded = async () => {
       try {
-        if (makingOffer.current[userId]) return;
-        makingOffer.current[userId] = true;
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         socket.emit('offer', { offer, to: userId });
       } catch (err) {
         console.error('Negotiation error:', err);
-      } finally {
-        makingOffer.current[userId] = false;
       }
     };
   };
