@@ -10,6 +10,8 @@ export default function VideoChat() {
   const [users, setUsers] = useState([]);
   const [socket, setSocket] = useState(null);
   const peerConnections = useRef({});
+  const makingOffer = useRef({}); // flag per peer
+
   const searchParams = new URLSearchParams(window.location.search);
   const roomId = searchParams.get('roomId');
   const username = searchParams.get('username');
@@ -39,13 +41,17 @@ export default function VideoChat() {
     newSocket.on('all-users', (otherUsers) => {
       setUsers(otherUsers);
       otherUsers.forEach(user => {
-        createPeerConnection(user.id, newSocket);
+        if (!peerConnections.current[user.id]) {
+          createPeerConnection(user.id, newSocket);
+        }
       });
     });
 
     newSocket.on('user-joined', ({ id, username }) => {
       setUsers(prev => [...prev, { id, username }]);
-      createPeerConnection(id, newSocket);
+      if (!peerConnections.current[id]) {
+        createPeerConnection(id, newSocket);
+      }
     });
 
     newSocket.on('user-left', ({ id }) => {
@@ -59,25 +65,48 @@ export default function VideoChat() {
         peerConnections.current[id].close();
         delete peerConnections.current[id];
       }
+      delete makingOffer.current[id];
     });
 
     newSocket.on('offer', async ({ offer, from }) => {
       if (!peerConnections.current[from]) {
         createPeerConnection(from, newSocket);
       }
-      await peerConnections.current[from].setRemoteDescription(new RTCSessionDescription(offer));
-      const answer = await peerConnections.current[from].createAnswer();
-      await peerConnections.current[from].setLocalDescription(answer);
-      newSocket.emit('answer', { answer, to: from });
+
+      const pc = peerConnections.current[from];
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        newSocket.emit('answer', { answer, to: from });
+      } catch (err) {
+        console.error('Error handling offer:', err);
+      }
     });
 
     newSocket.on('answer', async ({ answer, from }) => {
-      await peerConnections.current[from].setRemoteDescription(new RTCSessionDescription(answer));
+      const pc = peerConnections.current[from];
+      if (!pc) return;
+      if (pc.signalingState !== 'have-local-offer') {
+        console.warn('Skipping answer: wrong signalingState =', pc.signalingState);
+        return;
+      }
+
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      } catch (err) {
+        console.error('Failed to set remote description (answer):', err);
+      }
     });
 
     newSocket.on('ice-candidate', async ({ candidate, from }) => {
-      if (peerConnections.current[from]) {
-        await peerConnections.current[from].addIceCandidate(new RTCIceCandidate(candidate));
+      const pc = peerConnections.current[from];
+      if (pc) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding received ICE candidate', err);
+        }
       }
     });
 
@@ -100,8 +129,8 @@ export default function VideoChat() {
     });
 
     peerConnections.current[userId] = pc;
+    makingOffer.current[userId] = false;
 
-    // Add local stream tracks
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track =>
         pc.addTrack(track, localStreamRef.current)
@@ -122,9 +151,17 @@ export default function VideoChat() {
     };
 
     pc.onnegotiationneeded = async () => {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      socket.emit('offer', { offer, to: userId });
+      try {
+        if (makingOffer.current[userId]) return;
+        makingOffer.current[userId] = true;
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        socket.emit('offer', { offer, to: userId });
+      } catch (err) {
+        console.error('Negotiation error:', err);
+      } finally {
+        makingOffer.current[userId] = false;
+      }
     };
   };
 
