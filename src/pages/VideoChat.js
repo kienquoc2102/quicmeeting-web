@@ -10,6 +10,8 @@ export default function VideoChat() {
   const [users, setUsers] = useState([]);
   const [socket, setSocket] = useState(null);
   const peerConnections = useRef({});
+  const pendingCandidates = useRef({});
+
   const searchParams = new URLSearchParams(window.location.search);
   const roomId = searchParams.get('roomId');
   const username = searchParams.get('username');
@@ -59,25 +61,37 @@ export default function VideoChat() {
         peerConnections.current[id].close();
         delete peerConnections.current[id];
       }
+      delete pendingCandidates.current[id];
     });
 
     newSocket.on('offer', async ({ offer, from }) => {
-      if (!peerConnections.current[from]) {
+      let pc = peerConnections.current[from];
+      if (!pc) {
         createPeerConnection(from, newSocket);
+        pc = peerConnections.current[from];
       }
 
-      const pc = peerConnections.current[from];
       try {
-        if (pc.signalingState === 'stable') {
-          await pc.setRemoteDescription(new RTCSessionDescription(offer));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          newSocket.emit('answer', { answer, to: from });
-        } else {
+        if (pc.signalingState === 'have-local-offer') {
           console.warn(`Skipping offer: signalingState = ${pc.signalingState}`);
+          return;
         }
+
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+
+        // Xử lý các ICE candidate bị nhận sớm
+        if (pendingCandidates.current[from]) {
+          for (const candidate of pendingCandidates.current[from]) {
+            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+          }
+          delete pendingCandidates.current[from];
+        }
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        newSocket.emit('answer', { answer, to: from });
       } catch (err) {
-        console.error('Failed to set remote description (offer):', err);
+        console.error('Failed to handle offer:', err);
       }
     });
 
@@ -86,10 +100,7 @@ export default function VideoChat() {
       if (!pc) return;
 
       try {
-        if (pc.signalingState === 'have-local-offer') {
-          await pc.setRemoteDescription(new RTCSessionDescription(answer));
-        } else if (!pc.currentRemoteDescription && pc.signalingState === 'stable') {
-          console.warn('Receiving answer in stable state — accepting anyway');
+        if (!pc.currentRemoteDescription) {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
         } else {
           console.warn(`Skipping answer: unexpected signalingState = ${pc.signalingState}`);
@@ -100,12 +111,21 @@ export default function VideoChat() {
     });
 
     newSocket.on('ice-candidate', async ({ candidate, from }) => {
-      if (peerConnections.current[from]) {
-        try {
-          await peerConnections.current[from].addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (err) {
-          console.error('Error adding ICE candidate:', err);
+      const pc = peerConnections.current[from];
+
+      if (!pc || !pc.remoteDescription) {
+        // Nếu chưa có peer hoặc chưa set remoteDescription, lưu vào buffer
+        if (!pendingCandidates.current[from]) {
+          pendingCandidates.current[from] = [];
         }
+        pendingCandidates.current[from].push(candidate);
+        return;
+      }
+
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (err) {
+        console.error('Error adding ICE candidate:', err);
       }
     });
 
